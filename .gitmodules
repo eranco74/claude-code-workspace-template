@@ -1,0 +1,21 @@
+[submodule "fulfillment-service"]
+	path = fulfillment-service
+	url = https://github.com/osac-project/fulfillment-service.git
+[submodule "osac-operator"]
+	path = osac-operator
+	url = https://github.com/osac-project/osac-operator.git
+[submodule "osac-aap"]
+	path = osac-aap
+	url = https://github.com/osac-project/osac-aap
+[submodule "osac-installer"]
+	path = osac-installer
+	url = https://github.com/osac-project/osac-installer.git
+[submodule "osac-templates"]
+	path = osac-templates
+	url = https://github.com/osac-project/osac-templates
+[submodule "osac-test-infra"]
+	path = osac-test-infra
+	url = https://github.com/osac-project/osac-test-infra.git
+[submodule "enhancement-proposals"]
+	path = enhancement-proposals
+	url = https://github.com/osac-project/enhancement-proposals

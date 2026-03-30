@@ -4,78 +4,251 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Context
 
-<!-- What language(s), frameworks, and tools does this project use? -->
-<!-- Example: Primary languages: Go, TypeScript. Primary tools: kubectl, docker, npm. -->
+Primary languages: Go, YAML, Python, Markdown. Primary tools: kubectl, jira CLI, gh CLI, gws CLI. When debugging Kubernetes operators, check for stale vendor directories and cached images before rebuilding.
 
 ## Project Overview
 
-<!-- What does this project do? What problem does it solve? -->
-<!-- Example: A REST API for managing widget inventories, built with Express and PostgreSQL. -->
+OSAC (OpenShift-as-a-Service-in-a-Container) is a fulfillment system for provisioning Kubernetes clusters and compute instances with networking capabilities. The project consists of multiple components that work together to provide a complete infrastructure management platform.
 
 ### Repository Structure
 
-<!-- Describe the high-level directory layout -->
-<!-- Example:
-- **src/**: Application source code
-- **tests/**: Test suites
-- **docs/**: Documentation
-- **scripts/**: Build and deployment scripts
--->
+This is a monorepo containing:
+
+- **fulfillment-service**: gRPC server implementation with REST gateway, PostgreSQL backend, and integrated API definitions
+- **osac-operator**: Kubernetes operator for deploying OpenShift clusters via Hosted Control Planes
+- **osac-aap**: Ansible Automation Platform roles and playbooks for network provisioning
+- **osac-installer**: Installation manifests and prerequisites
+- **osac-test-infra**: Integration testing infrastructure
+- **enhancement-proposals**: Design documents and enhancement proposals
+
+Note: `fulfillment-api` and `fulfillment-common` were merged into `fulfillment-service`.
+
+### Current Project State
+
+The project recently completed v1.0 of the OSAC Networking API (see `.planning/PROJECT.md`), which provides:
+- VirtualNetwork, Subnet, SecurityGroup, and NetworkClass resources
+- Full gRPC and REST/JSON API surface
+- OpenAPI v2/v3 specifications
+- Protocol Buffer schemas for all networking primitives
 
 ## Development Commands
 
-<!-- List the commands Claude should know about -->
-<!-- Example:
+### fulfillment-service (Go backend with integrated API)
+
 ```bash
-# Build
-npm run build
+cd fulfillment-service
 
-# Run tests
-npm test
+# Build the binary
+go build
 
-# Run a single test file
-npm test -- --grep "widget creation"
+# Run unit tests (excludes integration tests in it/)
+ginkgo run -r internal
 
-# Lint
-npm run lint
+# Run integration tests (requires kind)
+ginkgo run it
 
-# Start development server
-npm run dev
+# Run integration tests with specific deployment mode
+IT_DEPLOY_MODE=kustomize ginkgo run it
+
+# Preserve kind cluster after integration tests (for debugging)
+IT_KEEP_KIND=true ginkgo run it
+
+# Run only setup phase (creates cluster without running tests)
+IT_KEEP_KIND=true ginkgo run --label-filter setup it
 ```
--->
+
+**Running the service locally:**
+
+```bash
+# Start PostgreSQL in a container
+podman run -d --name postgresql_database \
+  -e POSTGRESQL_USER=user -e POSTGRESQL_PASSWORD=pass -e POSTGRESQL_DATABASE=db \
+  -p 127.0.0.1:5432:5432 quay.io/sclorg/postgresql-15-c9s:latest
+
+# Start gRPC server
+./fulfillment-service start grpc-server \
+  --log-level=debug \
+  --grpc-listener-address=localhost:8000 \
+  --db-url=postgres://user:pass@localhost:5432/db
+
+# Start REST gateway (in another terminal)
+./fulfillment-service start rest-gateway \
+  --log-level=debug \
+  --http-listener-address=localhost:8001 \
+  --grpc-server-address=localhost:8000 \
+  --grpc-server-plaintext
+```
+
+**Testing the API:**
+
+```bash
+# Test gRPC with grpcurl
+grpcurl -plaintext localhost:8000 list
+grpcurl -plaintext localhost:8000 fulfillment.v1.VirtualNetworks/List
+
+# Test REST with curl
+curl http://localhost:8001/api/fulfillment/v1/virtual_networks | jq
+```
+
+### osac-operator (Kubernetes operator)
+
+```bash
+cd osac-operator
+
+# Build and push container image
+make image-build image-push IMG=<registry>/osac-operator:tag
+
+# Install CRDs
+make install
+
+# Deploy operator
+make deploy IMG=<registry>/osac-operator:tag
+
+# Uninstall
+make uninstall
+
+# Undeploy operator
+make undeploy
+```
 
 ## Architecture Patterns
 
-<!-- Describe key patterns and conventions in your codebase -->
-<!-- Example:
-### API Design
-- RESTful endpoints under /api/v1/
-- Request validation with Zod schemas
-- Error responses follow RFC 7807 (Problem Details)
+### API Design Pattern (Protocol Buffers)
 
-### Database
-- Migrations in src/db/migrations/
-- Repository pattern for data access
-- All queries use parameterized statements
--->
+The fulfillment-service follows a consistent pattern:
 
-## Common Pitfalls
+```
+fulfillment-service/proto/public/osac/public/v1/    # Public API
+fulfillment-service/proto/private/osac/private/v1/  # Private API
+Each resource has:
+├── <resource>_type.proto         # Resource schema definition
+└── <resource>s_service.proto     # CRUD service operations
+```
 
-<!-- What mistakes should Claude avoid? -->
-<!-- Example:
-- Always run migrations before testing: `npm run db:migrate`
-- The `config/` directory is generated -- don't edit it directly
-- Tests require a running PostgreSQL instance (see docker-compose.yml)
--->
+**Type files** define:
+- Resource message with metadata (id, name, labels, annotations)
+- Status enum (Pending, Ready, Failed)
+- Spec fields (resource-specific configuration)
+- Status fields (observed state)
 
-## Git & PR Workflow
+**Service files** define:
+- Create/Get/List/Update/Delete RPC methods
+- Request/Response messages for each operation
+- HTTP annotations for REST gateway (google.api.http)
+- OpenAPI annotations for documentation
 
-<!-- How should Claude handle git operations? -->
-<!-- Example:
-- Commit messages use Conventional Commits format (feat:, fix:, chore:)
-- PRs target the `main` branch
-- Always run `npm test` before committing
--->
+### Public vs Private API Split
+
+Some resources (e.g., NetworkClass, HostClass) exist in both APIs:
+
+- **Public API** (`fulfillment-service/proto/public/osac/public/v1/`): User-facing, read-only operations
+  - Get and List methods available
+  - Create/Update/Delete marked as "system-only"
+
+- **Private API** (`fulfillment-service/proto/private/osac/private/v1/`): Admin/controller operations
+  - Full CRUD operations
+  - Additional Signal RPC for controller reconciliation (no HTTP endpoint)
+  - Schema duplicated (follows HostClass pattern)
+
+### Multi-tenancy
+
+All resources include tenant isolation metadata:
+- `metadata.annotations["osac.io/tenant-id"]` for tenant scoping
+- `metadata.annotations["osac.io/owner-reference"]` for resource hierarchy
+- OPA (Open Policy Agent) policies enforce isolation at runtime
+
+### Resource Hierarchy
+
+Parent-child relationships use owner references:
+```
+VirtualNetwork (parent)
+├── Subnet (child, references VirtualNetwork via annotations)
+└── SecurityGroup (child, references VirtualNetwork via annotations)
+```
+
+### Service Implementation Pattern
+
+The fulfillment-service uses:
+- PostgreSQL for persistent storage
+- gRPC with grpc-gateway for REST/JSON support
+- Controller-runtime for Kubernetes integration
+- OPA for authorization policies
+- Prometheus for metrics
+
+### Integration Testing
+
+Integration tests use:
+- Kind clusters (named "fulfillment-service-it")
+- TLS with SNI routing via Envoy Gateway
+- Keycloak for authentication
+- Requires `/etc/hosts` entries for:
+  - `127.0.0.1 keycloak.keycloak.svc.cluster.local`
+  - `127.0.0.1 fulfillment-api.innabox.svc.cluster.local`
+
+## Protocol Buffer Conventions
+
+### Naming Conventions
+
+- **Files**: `snake_case` (e.g., `virtual_network_type.proto`)
+- **Messages**: `PascalCase` (e.g., `VirtualNetwork`)
+- **Fields**: `snake_case` (e.g., `ipv4_cidr`)
+- **Enums**: `SCREAMING_SNAKE_CASE` (e.g., `STATE_PENDING`)
+- **Services**: `PascalCase` (e.g., `VirtualNetworks`)
+- **RPCs**: `PascalCase` (e.g., `CreateVirtualNetwork`)
+
+### Field Validation
+
+Use buf.build validation annotations:
+- CIDR validation: Use `string` type with validation comments
+- Enums: Define explicit values (tcp, udp, icmp, all)
+- Required fields: Mark as non-optional in comments
+- References: Use `string` fields for resource IDs
+
+### Optional vs Required Fields
+
+- Use `optional` keyword for fields that may not be set (e.g., IPv6 CIDR in dual-stack configs)
+- Omit `optional` for fields that should always have values (even if empty string/0)
+- Optional CIDR fields enable IPv4-only, IPv6-only, and dual-stack modes
+
+### Update Operations
+
+Use `google.protobuf.FieldMask` for partial updates:
+```protobuf
+message UpdateVirtualNetworkRequest {
+  VirtualNetwork virtual_network = 1;
+  google.protobuf.FieldMask update_mask = 2;
+}
+```
+
+### List Operations
+
+Include SQL-like filtering:
+```protobuf
+message ListVirtualNetworksRequest {
+  int32 page = 1;
+  int32 size = 2;
+  string filter = 3;  // SQL WHERE clause syntax
+  string order = 4;   // SQL ORDER BY syntax
+}
+```
+
+## OpenAPI Generation Pipeline
+
+The fulfillment-service includes proto files and OpenAPI generation:
+
+```bash
+cd fulfillment-service
+
+# Validate proto files with buf lint
+buf lint
+
+# Generate Go code from protos
+buf generate
+```
+
+OpenAPI specs are located at:
+- `fulfillment-service/openapi/v2/openapi.json`
+- `fulfillment-service/openapi/v3/openapi.yaml`
 
 ## GSD Workflow Integration
 
@@ -91,3 +264,101 @@ When working on this project:
 - Use `/gsd:progress` to check project status
 - Use `/gsd:plan-phase` when planning new work
 - Use `/gsd:execute-phase` to implement planned phases
+
+## Key Technologies
+
+- **Protocol Buffers**: API definition language (proto3 syntax)
+- **gRPC**: RPC framework for service-to-service communication
+- **grpc-gateway**: HTTP/JSON to gRPC transcoding
+- **Buf**: Proto linting and code generation
+- **PostgreSQL**: Persistent storage for fulfillment-service
+- **Kubernetes**: Deployment platform (OpenShift required for operator)
+- **Ginkgo**: BDD testing framework for Go
+- **gomock**: Mock generation for unit tests
+- **Kind**: Kubernetes-in-Docker for integration tests
+- **OPA**: Open Policy Agent for authorization
+
+## Common Pitfalls
+
+### Proto File Changes
+
+- Always run `buf lint` before committing proto changes
+- Regenerate code with `buf generate` after proto changes
+- Ensure `SERVICE_SUFFIX` lint rule is excluded in buf.yaml
+
+### Integration Tests
+
+- Integration tests require `/etc/hosts` entries (see Architecture Patterns section)
+- Use `IT_KEEP_KIND=true` to preserve cluster for debugging
+- Clean up preserved clusters with: `kind delete cluster --name fulfillment-service-it`
+- Default deployment mode is Helm, use `IT_DEPLOY_MODE=kustomize` to switch
+
+### OpenAPI Generation
+
+- OpenAPI specs are generated from proto files via buf generate
+- Both v2 (JSON) and v3 (YAML) specs are generated and committed
+
+### Multi-tenant Resources
+
+- Never skip tenant isolation metadata in new resources
+- Use annotations for owner references, not separate fields
+- Test with different tenant IDs to verify isolation
+- OPA policies are enforced at runtime, not at schema level
+
+
+## Development Environment Setup
+
+The recommended setup uses `direnv` to manage environment variables:
+
+```bash
+# Create project directory
+mkdir ~/osac-project
+cd ~/osac-project
+
+# Create .envrc
+cat > .envrc << 'EOF'
+# Configure Go:
+export GOROOT="${HOME}/go"
+export GOPATH="${PWD}/.local"
+export GOBIN="${PWD}/.local/bin"
+PATH_add "${GOROOT}/bin"
+PATH_add "${PWD}/.local/bin"
+EOF
+
+# Allow direnv
+direnv allow
+
+# Clone repository
+git clone <repo-url> repository
+cd repository
+```
+
+## Testing Against OpenShift Cluster
+
+When deploying to OpenShift:
+
+```bash
+# Enable HTTP/2 for gRPC
+kubectl annotate ingresses.config/cluster ingress.operator.openshift.io/default-enable-http2=true
+
+# Deploy with kustomize
+kubectl apply -k fulfillment-service/manifests
+
+# Get service account token
+export token=$(kubectl create token -n innabox client)
+
+# Get route host
+export route=$(kubectl get route -n innabox fulfillment-api -o json | jq -r '.spec.host')
+
+# Test gRPC
+grpcurl -insecure -H "Authorization: Bearer ${token}" \
+  ${route}:443 fulfillment.v1.VirtualNetworks/List
+
+# Test REST
+curl --silent --insecure --header "Authorization: Bearer ${token}" \
+  https://${route}:443/api/fulfillment/v1/virtual_networks | jq
+```
+
+## Git & PR Workflow
+
+When creating PRs, always target the `origin` remote unless explicitly told otherwise. Never push to a fork remote by default.
