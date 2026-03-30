@@ -10,9 +10,6 @@
 [submodule "osac-installer"]
 	path = osac-installer
 	url = https://github.com/osac-project/osac-installer.git
-[submodule "osac-templates"]
-	path = osac-templates
-	url = https://github.com/osac-project/osac-templates
 [submodule "osac-test-infra"]
 	path = osac-test-infra
 	url = https://github.com/osac-project/osac-test-infra.git
